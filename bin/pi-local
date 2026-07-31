@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec pi --provider bonsai --model bonsai-27b --thinking high "$@"

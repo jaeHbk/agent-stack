@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE_PATH" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+  SOURCE_TARGET="$(readlink "$SOURCE_PATH")"
+  case "$SOURCE_TARGET" in
+    /*) SOURCE_PATH="$SOURCE_TARGET" ;;
+    *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_TARGET" ;;
+  esac
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+# shellcheck disable=SC1091
+source "$BIN_DIR/../scripts/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: agent-stack COMMAND [ARGS]
+
+Commands:
+  setup [OPTIONS]                Plan or reconcile the complete stack
+  preflight [OPTIONS]            Report all onboarding prerequisites together
+  status                         Show component and service status
+  doctor [--quick] [--profile P] Validate configuration and live inference
+  diagnostics [FILE]             Create a redacted support archive
+  security-audit                  Query OSV and enforce reviewed remediations
+  start | stop | restart         Control the Bonsai LaunchAgent
+  logs                           Follow recent Bonsai logs
+  export [FILE] [--include-secrets]
+                                 Create a portable user-data archive
+  restore FILE                   Restore an archive, then reconcile config
+  versions                       Print pinned component revisions
+EOF
+}
+
+start_service() {
+  [ -x "$LLAMA_SERVER" ] || die "missing llama-server: $LLAMA_SERVER"
+  [ -f "$BONSAI_MODEL" ] || die "missing model: $BONSAI_MODEL"
+  [ -f "$LAUNCH_AGENT_PLIST" ] || die "missing LaunchAgent: $LAUNCH_AGENT_PLIST"
+  if service_loaded; then
+    launchctl kickstart -k "$LAUNCHD_DOMAIN/$LAUNCH_AGENT_LABEL"
+  else
+    bootstrap_bonsai_service 6 2 || die "could not load Bonsai LaunchAgent"
+  fi
+  wait_for_server 240 || die "Bonsai server did not become ready"
+  log "Bonsai is ready at $BONSAI_BASE_URL/v1"
+}
+
+stop_service() {
+  if service_loaded; then
+    launchctl bootout "$LAUNCHD_DOMAIN/$LAUNCH_AGENT_LABEL"
+    wait_for_service_unloaded 30 || die "Bonsai LaunchAgent did not finish unloading"
+    log "Bonsai stopped"
+  else
+    log "Bonsai is already stopped"
+  fi
+}
+
+show_status() {
+  printf '%-18s %s\n' 'Profile' "$(stack_profile)"
+  printf '%-18s %s\n' 'Stack root' "$STACK_ROOT"
+  printf '%-18s %s\n' 'Runtime data' "$STACK_DATA"
+  printf '%-18s %s\n' 'Pi' "$(pi --version 2>/dev/null || printf 'not installed')"
+  if command -v hermes >/dev/null 2>&1; then
+    printf '%-18s %s\n' 'Hermes command' "$(command -v hermes)"
+    printf '%-18s %s\n' 'Hermes version' "$(hermes --version 2>/dev/null | head -n 1 || printf 'unknown')"
+  else
+    printf '%-18s %s\n' 'Hermes' 'not installed'
+  fi
+  if [ -d "$LLAMA_DIR/.git" ]; then
+    printf '%-18s %s\n' 'llama.cpp' "$(git -C "$LLAMA_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+  else
+    printf '%-18s %s\n' 'llama.cpp' 'not installed'
+  fi
+  if [ -f "$BONSAI_MODEL" ]; then
+    printf '%-18s %s\n' 'Bonsai model' "present ($(file_size "$BONSAI_MODEL") bytes)"
+  else
+    printf '%-18s %s\n' 'Bonsai model' 'missing'
+  fi
+  if service_loaded; then
+    printf '%-18s %s\n' 'LaunchAgent' 'loaded'
+  else
+    printf '%-18s %s\n' 'LaunchAgent' 'stopped'
+  fi
+  if server_ready; then
+    local model_id
+    model_id="$(curl --silent \
+      -H "Authorization: Bearer $(bonsai_api_key)" \
+      "$BONSAI_BASE_URL/v1/models" | jq -r '.data[0].id // "unknown"')"
+    printf '%-18s %s\n' 'Inference API' "ready ($model_id)"
+  else
+    printf '%-18s %s\n' 'Inference API' 'unavailable'
+  fi
+  if [ -L "$HOME/.local/bin/hermes-metal" ]; then
+    printf '%-18s %s\n' 'Hermes Metal' "preserved as $(readlink "$HOME/.local/bin/hermes-metal")"
+  fi
+}
+
+export_stack() {
+  local output=""
+  local include_secrets=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --include-secrets) include_secrets=true ;;
+      -*) die "unknown export option: $1" ;;
+      *)
+        [ -z "$output" ] || die "export accepts one output file"
+        output="$1"
+        ;;
+    esac
+    shift
+  done
+  [ -n "$output" ] || output="$PWD/agent-stack-export-$(timestamp).tar.gz"
+  output="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$output")"
+
+  local stage
+  stage="$(mktemp -d)"
+  trap 'rm -rf "$stage"' RETURN
+  mkdir -p "$stage/home/.hermes" "$stage/home/.pi/agent"
+
+  if [ -d "$HERMES_HOME" ]; then
+    if [ "$include_secrets" = true ]; then
+      rsync -a \
+        --exclude 'hermes-agent/' \
+        --exclude 'venv/' \
+        --exclude 'node/' \
+        --exclude 'bin/' \
+        --exclude 'logs/' \
+        --exclude '__pycache__/' \
+        "$HERMES_HOME/" "$stage/home/.hermes/"
+    else
+      rsync -a \
+        --exclude 'hermes-agent/' \
+        --exclude 'venv/' \
+        --exclude 'node/' \
+        --exclude 'bin/' \
+        --exclude 'logs/' \
+        --exclude '__pycache__/' \
+        --exclude '.env' \
+        "$HERMES_HOME/" "$stage/home/.hermes/"
+    fi
+  fi
+
+  for name in settings.json models.json; do
+    [ -f "$PI_AGENT_DIR/$name" ] && cp -p "$PI_AGENT_DIR/$name" "$stage/home/.pi/agent/$name"
+  done
+  if [ "$include_secrets" = true ] && [ -f "$PI_AGENT_DIR/auth.json" ]; then
+    cp -p "$PI_AGENT_DIR/auth.json" "$stage/home/.pi/agent/auth.json"
+  fi
+
+  printf '{"format":1,"created_at":"%s","include_secrets":%s,"hermes_commit":"%s","llama_commit":"%s","model_revision":"%s"}\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$include_secrets" \
+    "$HERMES_COMMIT" \
+    "$LLAMA_COMMIT" \
+    "$BONSAI_REVISION" > "$stage/manifest.json"
+  tar -C "$stage" -czf "$output" manifest.json home
+  chmod 600 "$output"
+  rm -rf "$stage"
+  trap - RETURN
+  log "portable archive written to $output"
+  if [ "$include_secrets" = true ]; then
+    warn "archive contains plaintext credentials"
+  fi
+}
+
+restore_stack() {
+  [ "$#" -eq 1 ] || die "usage: agent-stack restore FILE"
+  local archive="$1"
+  [ -f "$archive" ] || die "archive not found: $archive"
+
+  local entry
+  while IFS= read -r entry; do
+    case "$entry" in
+      /*|../*|*/../*|*/..) die "unsafe archive path: $entry" ;;
+    esac
+  done < <(tar -tzf "$archive")
+
+  local stage backup_dir
+  stage="$(mktemp -d)"
+  backup_dir="$STACK_BACKUPS/restore-$(timestamp)"
+  trap 'rm -rf "$stage"' RETURN
+  tar -C "$stage" -xzf "$archive"
+  [ -f "$stage/manifest.json" ] || die "archive has no manifest.json"
+  [ "$(jq -r '.format // 0' "$stage/manifest.json")" = "1" ] || die "unsupported archive format"
+
+  mkdir -p "$backup_dir/pi" "$backup_dir/hermes"
+  chmod 700 "$backup_dir"
+  backup_item "$PI_AGENT_DIR/settings.json" "$backup_dir/pi"
+  backup_item "$PI_AGENT_DIR/models.json" "$backup_dir/pi"
+  backup_item "$PI_AGENT_DIR/auth.json" "$backup_dir/pi"
+  backup_item "$HERMES_HOME/config.yaml" "$backup_dir/hermes"
+  backup_item "$HERMES_HOME/.env" "$backup_dir/hermes"
+
+  if [ -d "$stage/home/.hermes" ]; then
+    mkdir -p "$HERMES_HOME"
+    rsync -a "$stage/home/.hermes/" "$HERMES_HOME/"
+  fi
+  if [ -d "$stage/home/.pi/agent" ]; then
+    mkdir -p "$PI_AGENT_DIR"
+    rsync -a "$stage/home/.pi/agent/" "$PI_AGENT_DIR/"
+  fi
+  ensure_bonsai_api_key
+  python3 "$STACK_ROOT/scripts/configure.py" dotenv \
+    --path "$HERMES_HOME/.env" \
+    --key "$BONSAI_HERMES_KEY_ENV" \
+    --value-file "$BONSAI_API_KEY_FILE"
+  python3 "$STACK_ROOT/scripts/configure.py" pi \
+    --home "$HOME" \
+    --stack-root "$STACK_ROOT" \
+    --api-key-file "$BONSAI_API_KEY_FILE"
+  rm -rf "$stage"
+  trap - RETURN
+  log "archive restored; previous configs are in $backup_dir"
+}
+
+print_versions() {
+  printf '%-22s %s\n' \
+    'Pi' "$PI_VERSION" \
+    'Hermes base' "$HERMES_COMMIT" \
+    'Hermes Feishu fix' "$HERMES_FEISHU_FIX_COMMIT" \
+    'Prism llama.cpp' "$LLAMA_COMMIT" \
+    'Pi workflows' 'repository-owned' \
+    'Bonsai model' "$BONSAI_REVISION" \
+    'Bonsai SHA-256' "$BONSAI_SHA256"
+}
+
+command="${1:-}"
+[ -n "$command" ] || { usage; exit 1; }
+shift
+
+case "$command" in
+  setup) python3 "$STACK_ROOT/scripts/onboard.py" setup "$@" ;;
+  preflight) python3 "$STACK_ROOT/scripts/onboard.py" preflight "$@" ;;
+  status) show_status ;;
+  doctor) "$STACK_ROOT/scripts/doctor.sh" "$@" ;;
+  diagnostics) python3 "$STACK_ROOT/scripts/onboard.py" diagnostics "$@" ;;
+  security-audit) "$STACK_ROOT/scripts/security-audit.sh" "$@" ;;
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; start_service ;;
+  logs)
+    touch "$STACK_LOGS/bonsai.out.log" "$STACK_LOGS/bonsai.err.log"
+    tail -n 80 -f "$STACK_LOGS/bonsai.out.log" "$STACK_LOGS/bonsai.err.log"
+    ;;
+  export) export_stack "$@" ;;
+  restore) restore_stack "$@" ;;
+  versions) print_versions ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac

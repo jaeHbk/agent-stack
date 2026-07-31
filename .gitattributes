@@ -1,0 +1,4 @@
+# Vendored patches are checksum-pinned byte-for-byte. Their payload preserves
+# upstream whitespace so git's repository-level whitespace check must not
+# rewrite or reject them.
+patches/*.patch -whitespace

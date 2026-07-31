@@ -1,0 +1,38 @@
+name: onboarding
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install test prerequisites
+        run: brew install gitleaks jq ninja ripgrep
+      - name: Full-history secret scan
+        run: make secret-scan
+      - name: Static and unit tests
+        run: make test
+      - name: Isolated onboarding scenarios
+        run: make onboarding-test
+      - name: Verify plan is read-only on an incomplete home
+        run: |
+          export HOME="$RUNNER_TEMP/clean home"
+          export AGENT_STACK_DATA="$RUNNER_TEMP/clean data"
+          mkdir -p "$HOME"
+          set +e
+          ./bin/agent-stack setup --plan --profile cloud --json > "$RUNNER_TEMP/plan.jsonl"
+          status=$?
+          set -e
+          test "$status" -eq 2
+          test ! -e "$AGENT_STACK_DATA"

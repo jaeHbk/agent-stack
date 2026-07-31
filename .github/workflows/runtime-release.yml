@@ -1,0 +1,42 @@
+name: runtime artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build prerequisites
+        run: |
+          test "$(uname -m)" = arm64
+          brew install cmake ninja openssl@3
+      - name: Build immutable runtime pin
+        env:
+          AGENT_STACK_DATA: ${{ runner.temp }}/agent-stack
+        run: ./scripts/bootstrap.sh --phase runtime --profile local --runtime-source source
+      - name: Package deterministic artifact
+        env:
+          AGENT_STACK_DATA: ${{ runner.temp }}/agent-stack
+        run: |
+          mkdir -p dist
+          ./scripts/package-runtime.sh "$PWD/dist/llama-runtime-darwin-arm64.tar.gz" | tee dist/SHA256SUMS
+      - name: Verify packaged artifact
+        env:
+          AGENT_STACK_DATA: ${{ runner.temp }}/agent-stack
+        run: |
+          checksum="$(awk '{print $1}' dist/SHA256SUMS)"
+          test "$(shasum -a 256 dist/llama-runtime-darwin-arm64.tar.gz | awk '{print $1}')" = "$checksum"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: llama-runtime-darwin-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

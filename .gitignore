@@ -1,0 +1,6 @@
+.DS_Store
+.state/
+*.log
+*.partial
+*.tar.gz
+__pycache__/

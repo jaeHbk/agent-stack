@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${SERVER}</string>
+    <string>-m</string>
+    <string>${MODEL}</string>
+    <string>--alias</string>
+    <string>${MODEL_ID}</string>
+    <string>--host</string>
+    <string>${HOST}</string>
+    <string>--port</string>
+    <string>${PORT}</string>
+    <string>-c</string>
+    <string>${CONTEXT}</string>
+    <string>-ngl</string>
+    <string>99</string>
+    <string>-np</string>
+    <string>1</string>
+    <string>--jinja</string>
+    <string>-fa</string>
+    <string>on</string>
+    <string>-ctk</string>
+    <string>q4_0</string>
+    <string>-ctv</string>
+    <string>q4_0</string>
+    <string>--metrics</string>
+    <string>--api-key-file</string>
+    <string>${API_KEY_FILE}</string>
+    <string>--no-ui</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${WORKING_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>ThrottleInterval</key>
+  <integer>20</integer>
+  <key>StandardOutPath</key>
+  <string>${STDOUT}</string>
+  <key>StandardErrorPath</key>
+  <string>${STDERR}</string>
+</dict>
+</plist>

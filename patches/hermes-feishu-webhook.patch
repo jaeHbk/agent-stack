@@ -1,0 +1,1441 @@
+From 46c1cfec1e2ba1c7abf690a359a245402255ea70 Mon Sep 17 00:00:00 2001
+From: Eugeniusz Gilewski <egilewski@egilewski.com>
+Date: Mon, 27 Jul 2026 08:19:47 +0200
+Subject: [PATCH] fix(feishu): authenticate webhook traffic before quota
+
+Feishu webhook requests consumed the shared per-IP delivery bucket before
+their verification token and signature were checked. An unauthenticated
+caller could therefore exhaust legitimate Feishu delivery capacity, while
+malformed nested JSON and unbounded anomaly keys added avoidable pre-auth
+resource pressure.
+
+Validate bounded object payloads, decrypt protocol-correct Encrypt Key
+envelopes, and authenticate URL challenges or signed events before charging
+the delivery quota. Bound outer and nested message JSON work, contain
+malformed content before dispatch, and cap anomaly tracking without weakening
+the token or raw-body signature trust boundaries.
+
+Preserve websocket mode, plaintext signed callbacks, valid message dispatch,
+and unknown-event no-op behavior. URL re-verification now deliberately
+requires a Verification Token because Feishu challenge callbacks are
+unsigned; the setup output and both user guides document that migration.
+
+Validation covers 251 focused SDK-present tests and 205 SDK-denied tests,
+including 14 subtests in each mode, plus current-main relay capability tests,
+Ruff, compilation, documentation structure, and diff checks. The full
+repository run passed 48,020 tests; its 51 failures are confined to unrelated
+missing optional dependencies, installer/WeCom state, lazy dependency
+resolution, and a context-compressor timeout.
+
+The last completed CodeRabbit review found no issues; its current-main replay
+failed open after the bounded rate-limit retry. Independent current-base deep
+security and compatibility reviews found no worth-addressing issue.
+
+Fixes #29154
+---
+ plugins/platforms/feishu/adapter.py           | 296 +++++++-
+ tests/gateway/test_feishu.py                  | 693 +++++++++++++++++-
+ tests/gateway/test_setup_feishu.py            |  22 +-
+ website/docs/user-guide/messaging/feishu.md   |  28 +-
+ .../current/user-guide/messaging/feishu.md    |  30 +-
+ 5 files changed, 1000 insertions(+), 69 deletions(-)
+
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 751c2bf76dfd..848721cc1cd9 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -48,6 +48,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import base64
+ import collections
+ import concurrent.futures
+ import hashlib
+@@ -225,8 +226,11 @@
+ _FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120               # max requests per window per IP — matches openclaw
+ _FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096               # max tracked keys (prevents unbounded growth)
+ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request body
++_FEISHU_WEBHOOK_MAX_JSON_DEPTH = 64                # bound nested parser/normalization work
+ _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
+ _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
++_FEISHU_WEBHOOK_ANOMALY_MAX_KEYS = 4096            # max tracked source IPs
++_FEISHU_WEBHOOK_ANOMALY_SWEEP_INTERVAL_SECONDS = 60  # minimum interval between full-table scans
+ _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+ 
+ _APPROVAL_CHOICE_MAP: Dict[str, str] = {
+@@ -291,6 +295,36 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
+ FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
+ FALLBACK_IMAGE_TEXT = "[Image]"
+ FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
++
++
++class _InvalidFeishuMessagePayload(ValueError):
++    """Decoded Feishu message content is unsafe to normalize recursively."""
++
++
++class _FeishuWebhookCryptoUnavailable(RuntimeError):
++    """The pinned cryptography dependency is unavailable in a broken install."""
++
++
++def _json_containers_within_depth(value: Any, max_depth: int) -> bool:
++    """Check container depth iteratively so validation cannot recurse."""
++    stack = [(iter((value,)), 0)]
++    while stack:
++        values, parent_depth = stack[-1]
++        try:
++            item = next(values)
++        except StopIteration:
++            stack.pop()
++            continue
++        if not isinstance(item, (dict, list)):
++            continue
++        depth = parent_depth + 1
++        if depth > max_depth:
++            return False
++        children = item.values() if isinstance(item, dict) else item
++        stack.append((iter(children), depth))
++    return True
++
++
+ # ---------------------------------------------------------------------------
+ # Post/card parsing helpers
+ # ---------------------------------------------------------------------------
+@@ -903,10 +937,21 @@ def normalize_feishu_message(
+ 
+ 
+ def _load_feishu_payload(raw_content: str) -> Dict[str, Any]:
++    try:
++        if len(raw_content.encode("utf-8")) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
++            raise _InvalidFeishuMessagePayload("message content exceeds size limit")
++    except UnicodeEncodeError as exc:
++        raise _InvalidFeishuMessagePayload("message content is not valid UTF-8") from exc
++
+     try:
+         parsed = json.loads(raw_content) if raw_content else {}
+     except json.JSONDecodeError:
+         return {"text": raw_content}
++    except (ValueError, RecursionError) as exc:
++        raise _InvalidFeishuMessagePayload("message content is invalid JSON") from exc
++
++    if not _json_containers_within_depth(parsed, _FEISHU_WEBHOOK_MAX_JSON_DEPTH):
++        raise _InvalidFeishuMessagePayload("message content exceeds nesting limit")
+     return parsed if isinstance(parsed, dict) else {"content": parsed}
+ 
+ 
+@@ -1481,6 +1526,7 @@ def __init__(self, config: PlatformConfig):
+         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
+         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
++        self._webhook_anomaly_next_sweep_at = 0.0
+         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+         # Inbound events that arrived before the adapter loop was ready
+         # (e.g. during startup/restart or network-flap reconnect). A single
+@@ -2567,14 +2613,20 @@ async def _handle_message_event_data(self, data: Any) -> None:
+             return
+ 
+         chat_type = getattr(message, "chat_type", "p2p")
+-        await self._process_inbound_message(
+-            data=data,
+-            message=message,
+-            sender_id=getattr(sender, "sender_id", None),
+-            chat_type=chat_type,
+-            message_id=message_id,
+-            is_bot=_is_bot_sender(sender),
+-        )
++        try:
++            await self._process_inbound_message(
++                data=data,
++                message=message,
++                sender_id=getattr(sender, "sender_id", None),
++                chat_type=chat_type,
++                message_id=message_id,
++                is_bot=_is_bot_sender(sender),
++            )
++        except (_InvalidFeishuMessagePayload, RecursionError):
++            logger.warning(
++                "[Feishu] Dropping message with invalid nested content: %s",
++                message_id,
++            )
+ 
+     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
+         """Ignore read-receipt events that Hermes does not act on."""
+@@ -3224,7 +3276,8 @@ def _record_webhook_anomaly(self, remote_ip: str, status: str) -> None:
+         """Increment the anomaly counter for remote_ip and emit a WARNING every threshold hits.
+ 
+         Mirrors openclaw's createWebhookAnomalyTracker: TTL 6 hours, log every 25 consecutive
+-        error responses from the same IP.
++        error responses from the same IP. The source table is independently capped so
++        unauthenticated traffic cannot grow it without bound.
+         """
+         now = time.time()
+         entry = self._webhook_anomaly_counts.get(remote_ip)
+@@ -3243,7 +3296,26 @@ def _record_webhook_anomaly(self, remote_ip: str, status: str) -> None:
+                     )
+                 self._webhook_anomaly_counts[remote_ip] = (count, status, first_seen)
+                 return
+-        # Either first occurrence or TTL expired — start fresh.
++            del self._webhook_anomaly_counts[remote_ip]
++
++        if len(self._webhook_anomaly_counts) >= _FEISHU_WEBHOOK_ANOMALY_MAX_KEYS:
++            if now < self._webhook_anomaly_next_sweep_at:
++                return
++            self._webhook_anomaly_next_sweep_at = (
++                now + _FEISHU_WEBHOOK_ANOMALY_SWEEP_INTERVAL_SECONDS
++            )
++            expired_ips = [
++                ip
++                for ip, (_count, _status, first_seen) in self._webhook_anomaly_counts.items()
++                if now - first_seen >= _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS
++            ]
++            for ip in expired_ips:
++                del self._webhook_anomaly_counts[ip]
++
++            if len(self._webhook_anomaly_counts) >= _FEISHU_WEBHOOK_ANOMALY_MAX_KEYS:
++                return
++
++        # First occurrence, or a replacement after the prior entry expired.
+         self._webhook_anomaly_counts[remote_ip] = (1, status, now)
+ 
+     def _clear_webhook_anomaly(self, remote_ip: str) -> None:
+@@ -3501,16 +3573,47 @@ def _namespace_from_mapping(value: Any) -> Any:
+             return [FeishuAdapter._namespace_from_mapping(item) for item in value]
+         return value
+ 
++    def _decrypt_webhook_payload(self, encrypted: Any) -> bytes:
++        """Decrypt Feishu's IV-prefixed AES-CBC callback envelope."""
++        if not isinstance(encrypted, str) or not encrypted:
++            raise ValueError("encrypted payload must be a non-empty string")
++
++        try:
++            from cryptography.hazmat.primitives import padding
++            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
++        except ImportError as exc:
++            raise _FeishuWebhookCryptoUnavailable from exc
++
++        try:
++            ciphertext = base64.b64decode(encrypted, validate=True)
++            if (
++                len(ciphertext) < algorithms.AES.block_size // 8 * 2
++                or len(ciphertext) % (algorithms.AES.block_size // 8) != 0
++            ):
++                raise ValueError("invalid ciphertext length")
++
++            key = hashlib.sha256(self._encrypt_key.encode("utf-8")).digest()
++            iv = ciphertext[: algorithms.AES.block_size // 8]
++            decryptor = Cipher(
++                algorithms.AES(key),
++                modes.CBC(iv),
++            ).decryptor()
++            padded_plaintext = (
++                decryptor.update(ciphertext[algorithms.AES.block_size // 8 :])
++                + decryptor.finalize()
++            )
++            unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
++            plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
++        except (TypeError, ValueError) as exc:
++            raise ValueError("invalid encrypted payload") from exc
++
++        if len(plaintext) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
++            raise ValueError("decrypted payload exceeds size limit")
++        return plaintext
++
+     async def _handle_webhook_request(self, request: Any) -> Any:
+         remote_ip = (getattr(request, "remote", None) or "unknown")
+ 
+-        # Rate limiting — composite key: app_id:path:remote_ip (matches openclaw key structure).
+-        rate_key = f"{self._app_id}:{self._webhook_path}:{remote_ip}"
+-        if not self._check_webhook_rate_limit(rate_key):
+-            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
+-            self._record_webhook_anomaly(remote_ip, "429")
+-            return web.Response(status=429, text="Too Many Requests")
+-
+         # Content-Type guard — Feishu always sends application/json.
+         headers = getattr(request, "headers", {}) or {}
+         content_type = str(headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+@@ -3548,44 +3651,158 @@ async def _handle_webhook_request(self, request: Any) -> Any:
+ 
+         try:
+             payload = json.loads(body_bytes.decode("utf-8"))
+-        except (json.JSONDecodeError, UnicodeDecodeError):
++        except (ValueError, UnicodeDecodeError, RecursionError):
+             self._record_webhook_anomaly(remote_ip, "400")
+             return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
+ 
++        if not isinstance(payload, dict):
++            logger.warning(
++                "[Feishu] Webhook rejected: JSON payload is not an object from %s",
++                remote_ip,
++            )
++            self._record_webhook_anomaly(remote_ip, "400")
++            return web.json_response(
++                {"code": 400, "msg": "json payload must be an object"},
++                status=400,
++            )
++
++        if not _json_containers_within_depth(payload, _FEISHU_WEBHOOK_MAX_JSON_DEPTH):
++            logger.warning(
++                "[Feishu] Webhook rejected: JSON nesting exceeds limit from %s",
++                remote_ip,
++            )
++            self._record_webhook_anomaly(remote_ip, "400")
++            return web.json_response(
++                {"code": 400, "msg": "json payload is too deeply nested"},
++                status=400,
++            )
++
++        encrypted_request = "encrypt" in payload
++        if encrypted_request:
++            if not self._encrypt_key:
++                logger.warning(
++                    "[Feishu] Encrypted webhook rejected: no Encrypt Key configured"
++                )
++                self._record_webhook_anomaly(remote_ip, "400-encrypted")
++                return web.json_response(
++                    {"code": 400, "msg": "encrypted payload requires an Encrypt Key"},
++                    status=400,
++                )
++            try:
++                plaintext = self._decrypt_webhook_payload(payload.get("encrypt"))
++            except _FeishuWebhookCryptoUnavailable:
++                logger.error(
++                    "[Feishu] Encrypted webhook unavailable: cryptography dependency missing"
++                )
++                self._record_webhook_anomaly(remote_ip, "503-encrypted")
++                return web.json_response(
++                    {"code": 503, "msg": "webhook encryption unavailable"},
++                    status=503,
++                )
++            except (ValueError, UnicodeError):
++                logger.warning(
++                    "[Feishu] Webhook rejected: invalid encrypted payload from %s",
++                    remote_ip,
++                )
++                self._record_webhook_anomaly(remote_ip, "400-encrypted")
++                return web.json_response(
++                    {"code": 400, "msg": "invalid encrypted payload"},
++                    status=400,
++                )
++
++            try:
++                payload = json.loads(plaintext.decode("utf-8"))
++            except (ValueError, UnicodeDecodeError, RecursionError):
++                self._record_webhook_anomaly(remote_ip, "400-encrypted")
++                return web.json_response(
++                    {"code": 400, "msg": "invalid encrypted payload"},
++                    status=400,
++                )
++            if not isinstance(payload, dict) or not _json_containers_within_depth(
++                payload,
++                _FEISHU_WEBHOOK_MAX_JSON_DEPTH,
++            ):
++                self._record_webhook_anomaly(remote_ip, "400-encrypted")
++                return web.json_response(
++                    {"code": 400, "msg": "invalid encrypted payload"},
++                    status=400,
++                )
++
++        raw_header = payload.get("header")
++        if raw_header is None:
++            header: Dict[str, Any] = {}
++        elif isinstance(raw_header, dict):
++            header = raw_header
++        else:
++            logger.warning(
++                "[Feishu] Webhook rejected: header is not an object from %s",
++                remote_ip,
++            )
++            self._record_webhook_anomaly(remote_ip, "400")
++            return web.json_response(
++                {"code": 400, "msg": "header must be an object"},
++                status=400,
++            )
++
++        is_url_verification = payload.get("type") == "url_verification"
++
++        # Feishu challenge requests are unsigned, so their verification token is
++        # the only available source-authentication control.
++        if is_url_verification and not self._verification_token:
++            logger.warning(
++                "[Feishu] Webhook URL verification rejected: no verification token configured"
++            )
++            self._record_webhook_anomaly(remote_ip, "401-token")
++            return web.Response(status=401, text="Verification token not configured")
++
+         # Verification token check — second layer of defence beyond signature (matches openclaw).
+         if self._verification_token:
+-            header = payload.get("header") or {}
+             incoming_token = str(header.get("token") or payload.get("token") or "")
+             # Compare as bytes: compare_digest raises TypeError on a str with
+             # non-ASCII characters, and the token comes from the request body.
++            try:
++                incoming_token_bytes = incoming_token.encode("utf-8")
++            except UnicodeEncodeError:
++                logger.warning(
++                    "[Feishu] Webhook rejected: malformed verification token from %s",
++                    remote_ip,
++                )
++                self._record_webhook_anomaly(remote_ip, "400")
++                return web.Response(status=400, text="Malformed verification token")
+             if not incoming_token or not hmac.compare_digest(
+-                incoming_token.encode(), self._verification_token.encode()
++                incoming_token_bytes, self._verification_token.encode("utf-8")
+             ):
+                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
+                 self._record_webhook_anomaly(remote_ip, "401-token")
+                 return web.Response(status=401, text="Invalid verification token")
+ 
+-        # URL verification challenge — Feishu includes the verification token in
+-        # challenge requests. Validate the token (above) before reflecting the
+-        # challenge so an unauthenticated remote request cannot prove endpoint
+-        # control by getting attacker-supplied challenge data echoed back.
+-        if payload.get("type") == "url_verification":
+-            return web.json_response({"challenge": payload.get("challenge", "")})
+-
+         # Timing-safe signature verification (only enforced when encrypt_key is set).
+-        if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
++        # URL verification is token-authenticated and is unsigned by Feishu.
++        if (
++            not is_url_verification
++            and self._encrypt_key
++            and not self._is_webhook_signature_valid(request.headers, body_bytes)
++        ):
+             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
+             self._record_webhook_anomaly(remote_ip, "401-sig")
+             return web.Response(status=401, text="Invalid signature")
+ 
+-        if payload.get("encrypt"):
+-            logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
+-            self._record_webhook_anomaly(remote_ip, "400-encrypted")
+-            return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
++        # Charge only authenticated requests to the delivery quota. Otherwise,
++        # an external caller can exhaust the bucket before a legitimate Feishu
++        # delivery from the same address reaches token/signature verification.
++        rate_key = f"{self._app_id}:{self._webhook_path}:{remote_ip}"
++        if not self._check_webhook_rate_limit(rate_key):
++            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
++            self._record_webhook_anomaly(remote_ip, "429")
++            return web.Response(status=429, text="Too Many Requests")
++
++        # Reflect a challenge only after its configured token has matched.
++        if is_url_verification:
++            return web.json_response({"challenge": payload.get("challenge", "")})
+ 
+         self._clear_webhook_anomaly(remote_ip)
+ 
+-        event_type = str((payload.get("header") or {}).get("event_type") or "")
++        event_type = str(header.get("event_type") or "")
+         data = self._namespace_from_mapping(payload)
+         if event_type == "im.message.receive_v1":
+             self._on_message_event(data)
+@@ -3620,9 +3837,8 @@ def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
+         if not timestamp or not nonce or not signature:
+             return False
+         try:
+-            body_str = body_bytes.decode("utf-8", errors="replace")
+-            content = f"{timestamp}{nonce}{self._encrypt_key}{body_str}"
+-            computed = hashlib.sha256(content.encode("utf-8")).hexdigest()
++            prefix = f"{timestamp}{nonce}{self._encrypt_key}".encode("utf-8")
++            computed = hashlib.sha256(prefix + body_bytes).hexdigest()
+             # Compare as bytes: compare_digest raises TypeError on a str with
+             # non-ASCII characters, and the signature is a raw request header.
+             return hmac.compare_digest(computed.encode(), signature.encode())
+@@ -5623,7 +5839,13 @@ def interactive_setup() -> None:
+         if connection_mode == "webhook":
+             print_info("Webhook defaults: 127.0.0.1:8765/feishu/webhook")
+             print_info("Override with FEISHU_WEBHOOK_HOST / FEISHU_WEBHOOK_PORT / FEISHU_WEBHOOK_PATH")
+-            print_info("For signature verification, set FEISHU_ENCRYPT_KEY and FEISHU_VERIFICATION_TOKEN")
++            print_info(
++                "FEISHU_VERIFICATION_TOKEN is required to complete webhook URL verification"
++            )
++            print_info(
++                "FEISHU_ENCRYPT_KEY enables encrypted callback bodies and verifies "
++                "raw-request signatures on ordinary events; configure both secrets for new webhooks"
++            )
+     save_env_value("FEISHU_CONNECTION_MODE", connection_mode)
+ 
+     if bot_name:
+diff --git a/tests/gateway/test_feishu.py b/tests/gateway/test_feishu.py
+index 0e411b8cf600..0cc329f1a82f 100644
+--- a/tests/gateway/test_feishu.py
++++ b/tests/gateway/test_feishu.py
+@@ -1,6 +1,8 @@
+ """Tests for the Feishu gateway integration."""
+ 
+ import asyncio
++import base64
++import hashlib
+ import json
+ import os
+ import socket
+@@ -34,6 +36,26 @@ async def readexactly(self, size: int) -> bytes:
+         return self.body[:size]
+ 
+ 
++def _encrypted_webhook_body(payload: dict, encrypt_key: str) -> bytes:
++    """Build the IV-prefixed AES-CBC/PKCS7 envelope used by lark-oapi 1.6.8."""
++    from cryptography.hazmat.primitives import padding
++    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
++
++    plaintext = json.dumps(payload, separators=(",", ":")).encode()
++    padder = padding.PKCS7(algorithms.AES.block_size).padder()
++    padded_plaintext = padder.update(plaintext) + padder.finalize()
++    iv = b"0123456789abcdef"
++    encryptor = Cipher(
++        algorithms.AES(hashlib.sha256(encrypt_key.encode()).digest()),
++        modes.CBC(iv),
++    ).encryptor()
++    ciphertext = encryptor.update(padded_plaintext) + encryptor.finalize()
++    return json.dumps(
++        {"encrypt": base64.b64encode(iv + ciphertext).decode()},
++        separators=(",", ":"),
++    ).encode()
++
++
+ def _mock_event_dispatcher_builder(mock_handler_class):
+     mock_builder = Mock()
+     mock_builder.register_p2_im_message_message_read_v1 = Mock(return_value=mock_builder)
+@@ -3509,6 +3531,155 @@ def test_rate_limit_resets_after_window_expires(self):
+         adapter._webhook_rate_counts[ip] = (count, window_start - _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS - 1)
+         self.assertTrue(adapter._check_webhook_rate_limit(ip))
+ 
++    @staticmethod
++    def _webhook_request(body: bytes, *, remote: str, headers: dict | None = None):
++        return SimpleNamespace(
++            remote=remote,
++            content_length=len(body),
++            headers={"Content-Type": "application/json", **(headers or {})},
++            content=_FakeRequestContent(body),
++        )
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_invalid_verification_tokens_do_not_consume_authenticated_rate_limit(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"verification_token": "expected"}))
++
++        def request(token: str):
++            body = json.dumps({"header": {"token": token, "event_type": "unknown"}}).encode()
++            return self._webhook_request(body, remote="203.0.113.10")
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_RATE_LIMIT_MAX", 2):
++            self.assertEqual(asyncio.run(adapter._handle_webhook_request(request("invalid"))).status, 401)
++            self.assertEqual(asyncio.run(adapter._handle_webhook_request(request("invalid"))).status, 401)
++            response = asyncio.run(adapter._handle_webhook_request(request("expected")))
++
++        self.assertEqual(response.status, 200)
++        self.assertEqual([entry[0] for entry in adapter._webhook_rate_counts.values()], [1])
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_invalid_signatures_do_not_consume_authenticated_rate_limit(self):
++        import hashlib
++
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        encrypt_key = "expected-key"
++        adapter = FeishuAdapter(PlatformConfig(extra={"encrypt_key": encrypt_key}))
++        body = json.dumps({"header": {"event_type": "unknown"}}).encode()
++        auth_headers = {
++            "x-lark-request-timestamp": "1700000000",
++            "x-lark-request-nonce": "abc123",
++        }
++        signature = hashlib.sha256(b"1700000000abc123expected-key" + body).hexdigest()
++
++        def request(candidate: str):
++            return self._webhook_request(
++                body,
++                remote="203.0.113.11",
++                headers={**auth_headers, "x-lark-signature": candidate},
++            )
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_RATE_LIMIT_MAX", 2):
++            self.assertEqual(asyncio.run(adapter._handle_webhook_request(request("invalid"))).status, 401)
++            self.assertEqual(asyncio.run(adapter._handle_webhook_request(request("invalid"))).status, 401)
++            response = asyncio.run(adapter._handle_webhook_request(request(signature)))
++
++        self.assertEqual(response.status, 200)
++        self.assertEqual([entry[0] for entry in adapter._webhook_rate_counts.values()], [1])
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_authenticated_webhook_requests_remain_rate_limited(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"verification_token": "expected"}))
++        body = json.dumps({"header": {"token": "expected", "event_type": "unknown"}}).encode()
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_RATE_LIMIT_MAX", 2):
++            statuses = [
++                asyncio.run(
++                    adapter._handle_webhook_request(
++                        self._webhook_request(body, remote="203.0.113.12")
++                    )
++                ).status
++                for _ in range(3)
++            ]
++
++        self.assertEqual(statuses, [200, 200, 429])
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_invalid_auth_anomaly_tracking_is_bounded(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"verification_token": "expected"}))
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_ANOMALY_MAX_KEYS", 2):
++            for remote in ("203.0.113.20", "203.0.113.21", "203.0.113.22"):
++                body = json.dumps({"header": {"token": "invalid"}}).encode()
++                response = asyncio.run(
++                    adapter._handle_webhook_request(
++                        self._webhook_request(body, remote=remote)
++                    )
++                )
++                self.assertEqual(response.status, 401)
++
++        self.assertEqual(adapter._webhook_rate_counts, {})
++        self.assertLessEqual(len(adapter._webhook_anomaly_counts), 2)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_anomaly_tracking_prunes_expired_sources_at_capacity(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import (
++            FeishuAdapter,
++            _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS,
++        )
++
++        adapter = FeishuAdapter(PlatformConfig())
++        now = 20_000.0
++        adapter._webhook_anomaly_counts = {
++            "expired": (1, "401-token", now - _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS),
++            "active": (1, "401-token", now - 1),
++        }
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_ANOMALY_MAX_KEYS", 2), patch(
++            "plugins.platforms.feishu.adapter.time.time", return_value=now
++        ):
++            adapter._record_webhook_anomaly("replacement", "401-token")
++
++        self.assertEqual(set(adapter._webhook_anomaly_counts), {"active", "replacement"})
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_anomaly_tracking_amortizes_capacity_sweeps(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        class ScanCountingDict(dict):
++            scan_count = 0
++
++            def items(self):
++                self.scan_count += 1
++                return super().items()
++
++        adapter = FeishuAdapter(PlatformConfig())
++        adapter._webhook_anomaly_counts = ScanCountingDict(
++            {"active-1": (1, "401-token", 19_999.0), "active-2": (1, "401-token", 19_999.0)}
++        )
++
++        with patch("plugins.platforms.feishu.adapter._FEISHU_WEBHOOK_ANOMALY_MAX_KEYS", 2), patch(
++            "plugins.platforms.feishu.adapter.time.time",
++            side_effect=[20_000.0, 20_001.0, 20_061.0],
++        ):
++            adapter._record_webhook_anomaly("unseen-1", "401-token")
++            adapter._record_webhook_anomaly("unseen-2", "401-token")
++            adapter._record_webhook_anomaly("unseen-3", "401-token")
++
++        self.assertEqual(adapter._webhook_anomaly_counts.scan_count, 2)
++        self.assertEqual(set(adapter._webhook_anomaly_counts), {"active-1", "active-2"})
++
+     @patch.dict(os.environ, {}, clear=True)
+     def test_webhook_request_rejects_oversized_body(self):
+         from gateway.config import PlatformConfig
+@@ -3561,6 +3732,122 @@ def test_webhook_request_rejects_invalid_json(self):
+         response = asyncio.run(adapter._handle_webhook_request(request))
+         self.assertEqual(response.status, 400)
+ 
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_request_rejects_non_object_json(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig())
++        payloads = ([], "value", 42, True, None)
++
++        for index, payload in enumerate(payloads):
++            remote = f"203.0.113.{40 + index}"
++            with self.subTest(payload=payload):
++                response = asyncio.run(
++                    adapter._handle_webhook_request(
++                        self._webhook_request(
++                            json.dumps(payload).encode(),
++                            remote=remote,
++                        )
++                    )
++                )
++
++                self.assertEqual(response.status, 400)
++                self.assertEqual(adapter._webhook_anomaly_counts[remote][1], "400")
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_request_accepts_object_json(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig())
++        dispatch_names = (
++            "_on_message_event",
++            "_on_message_read_event",
++            "_on_bot_added_to_chat",
++            "_on_bot_removed_from_chat",
++            "_on_reaction_event",
++            "_on_card_action_trigger",
++            "_on_drive_comment_event",
++            "_on_meeting_invited_event",
++        )
++        patchers = [patch.object(adapter, name) for name in dispatch_names]
++        dispatch_targets = [patcher.start() for patcher in patchers]
++        try:
++            response = asyncio.run(
++                adapter._handle_webhook_request(
++                    self._webhook_request(
++                        json.dumps({"header": {"event_type": "unknown"}}).encode(),
++                        remote="203.0.113.50",
++                    )
++                )
++            )
++        finally:
++            for patcher in reversed(patchers):
++                patcher.stop()
++
++        self.assertEqual(response.status, 200)
++        self.assertNotIn("203.0.113.50", adapter._webhook_anomaly_counts)
++        for dispatch_target in dispatch_targets:
++            dispatch_target.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_request_rejects_large_integer_before_quota_or_dispatch(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"verification_token": "expected"}))
++        remote = "203.0.113.51"
++        body = b'{"token":' + b"1" * 5_000 + b"}"
++
++        with patch.object(adapter, "_on_message_event") as dispatch:
++            response = asyncio.run(
++                adapter._handle_webhook_request(
++                    self._webhook_request(body, remote=remote)
++                )
++            )
++
++        self.assertEqual(response.status, 400)
++        self.assertEqual(adapter._webhook_anomaly_counts[remote][1], "400")
++        self.assertEqual(adapter._webhook_rate_counts, {})
++        dispatch.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_request_rejects_malformed_nested_shapes_before_quota(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        cases = {
++            "truthy non-mapping header": b'{"header":["bad"]}',
++            "unpaired-surrogate token": b'{"token":"\\ud800"}',
++            "excessive nesting": (
++                b'{"nested":'
++                + b"[" * 10_000
++                + b"0"
++                + b"]" * 10_000
++                + b"}"
++            ),
++            "nesting beyond normalization limit": (
++                b'{"nested":' + b"[" * 65 + b"0" + b"]" * 65 + b"}"
++            ),
++        }
++
++        for index, (name, body) in enumerate(cases.items()):
++            remote = f"203.0.113.{60 + index}"
++            adapter = FeishuAdapter(
++                PlatformConfig(extra={"verification_token": "expected"})
++            )
++            with self.subTest(name=name):
++                response = asyncio.run(
++                    adapter._handle_webhook_request(
++                        self._webhook_request(body, remote=remote)
++                    )
++                )
++
++                self.assertEqual(response.status, 400)
++                self.assertEqual(adapter._webhook_rate_counts, {})
++                self.assertEqual(adapter._webhook_anomaly_counts[remote][1], "400")
++
+     @patch.dict(os.environ, {"FEISHU_ENCRYPT_KEY": "secret"}, clear=True)
+     def test_webhook_request_rejects_bad_signature(self):
+         from gateway.config import PlatformConfig
+@@ -3611,13 +3898,291 @@ def test_webhook_loads_auth_secrets_from_platform_extra(self):
+         self.assertEqual(adapter._encrypt_key, "encrypt_from_extra")
+ 
+     @patch.dict(os.environ, {}, clear=True)
+-    def test_webhook_url_verification_challenge_passes_without_signature(self):
+-        """Challenge requests must succeed even when no encrypt_key is set."""
++    def test_webhook_ordinary_events_require_both_configured_secrets(self):
+         from gateway.config import PlatformConfig
+         from plugins.platforms.feishu.adapter import FeishuAdapter
+ 
+-        adapter = FeishuAdapter(PlatformConfig())
+-        body = json.dumps({"type": "url_verification", "challenge": "test_challenge_token"}).encode()
++        encrypt_key = "expected-key"
++        auth_headers = {
++            "x-lark-request-timestamp": "1700000000",
++            "x-lark-request-nonce": "abc123",
++        }
++
++        def signed_request(body: bytes, signature: str | None = None):
++            if signature is None:
++                signature = hashlib.sha256(
++                    b"1700000000abc123expected-key" + body
++                ).hexdigest()
++            return self._webhook_request(
++                body,
++                remote="203.0.113.70",
++                headers={**auth_headers, "x-lark-signature": signature},
++            )
++
++        cases = (
++            ("both valid", "expected", None, 200, 1),
++            ("valid token, bad signature", "expected", "invalid", 401, 0),
++            ("bad token, valid signature", "invalid", None, 401, 0),
++        )
++        for name, token, signature, expected_status, expected_quota in cases:
++            adapter = FeishuAdapter(
++                PlatformConfig(
++                    extra={
++                        "verification_token": "expected",
++                        "encrypt_key": encrypt_key,
++                    }
++                )
++            )
++            body = _encrypted_webhook_body(
++                {"header": {"token": token, "event_type": "unknown"}},
++                encrypt_key,
++            )
++            with self.subTest(name=name):
++                response = asyncio.run(
++                    adapter._handle_webhook_request(
++                        signed_request(body, signature)
++                    )
++                )
++
++                self.assertEqual(response.status, expected_status)
++                self.assertEqual(
++                    sum(count for count, _started in adapter._webhook_rate_counts.values()),
++                    expected_quota,
++                )
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_encrypted_ordinary_event_supports_encrypt_key_only(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        encrypt_key = "expected-key"
++        body = _encrypted_webhook_body(
++            {"header": {"event_type": "unknown"}},
++            encrypt_key,
++        )
++        auth_headers = {
++            "x-lark-request-timestamp": "1700000000",
++            "x-lark-request-nonce": "abc123",
++        }
++        valid_signature = hashlib.sha256(
++            b"1700000000abc123expected-key" + body
++        ).hexdigest()
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"encrypt_key": encrypt_key}))
++        request = self._webhook_request(
++            body,
++            remote="203.0.113.71",
++            headers={**auth_headers, "x-lark-signature": valid_signature},
++        )
++        dispatch_names = (
++            "_on_message_event",
++            "_on_message_read_event",
++            "_on_bot_added_to_chat",
++            "_on_bot_removed_from_chat",
++            "_on_reaction_event",
++            "_on_card_action_trigger",
++            "_on_drive_comment_event",
++            "_on_meeting_invited_event",
++        )
++        patchers = [patch.object(adapter, name) for name in dispatch_names]
++        dispatch_targets = [patcher.start() for patcher in patchers]
++        try:
++            response = asyncio.run(adapter._handle_webhook_request(request))
++        finally:
++            for patcher in reversed(patchers):
++                patcher.stop()
++
++        self.assertEqual(response.status, 200)
++        self.assertEqual(
++            sum(count for count, _started in adapter._webhook_rate_counts.values()),
++            1,
++        )
++        for dispatch_target in dispatch_targets:
++            dispatch_target.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_encrypted_event_without_local_key_fails_before_quota_or_dispatch(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        body = _encrypted_webhook_body(
++            {"header": {"token": "expected", "event_type": "im.message.receive_v1"}},
++            "expected-key",
++        )
++        adapter = FeishuAdapter(
++            PlatformConfig(extra={"verification_token": "expected"})
++        )
++
++        with patch.object(adapter, "_on_message_event") as dispatch:
++            response = asyncio.run(
++                adapter._handle_webhook_request(
++                    self._webhook_request(
++                        body,
++                        remote="203.0.113.72",
++                    )
++                )
++            )
++
++        self.assertEqual(response.status, 400)
++        self.assertEqual(adapter._webhook_rate_counts, {})
++        dispatch.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_invalid_ciphertext_fails_uniformly_before_quota_or_dispatch(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(
++            PlatformConfig(extra={"encrypt_key": "expected-key"})
++        )
++        bodies = (
++            b'{"encrypt":"not-base64!"}',
++            json.dumps(
++                {"encrypt": base64.b64encode(b"too-short").decode()}
++            ).encode(),
++        )
++
++        for body in bodies:
++            with self.subTest(body=body), patch.object(
++                adapter,
++                "_namespace_from_mapping",
++            ) as normalize:
++                response = asyncio.run(
++                    adapter._handle_webhook_request(
++                        self._webhook_request(
++                            body,
++                            remote="203.0.113.73",
++                        )
++                    )
++                )
++                self.assertEqual(response.status, 400)
++                self.assertEqual(
++                    json.loads(response.body),
++                    {"code": 400, "msg": "invalid encrypted payload"},
++                )
++                self.assertEqual(adapter._webhook_rate_counts, {})
++                normalize.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_encryption_dependency_failure_is_controlled(self):
++        import builtins
++
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        body = _encrypted_webhook_body(
++            {
++                "type": "url_verification",
++                "token": "expected",
++                "challenge": "test_challenge_token",
++            },
++            "expected-key",
++        )
++        adapter = FeishuAdapter(
++            PlatformConfig(
++                extra={
++                    "verification_token": "expected",
++                    "encrypt_key": "expected-key",
++                }
++            )
++        )
++        original_import = builtins.__import__
++
++        def import_without_crypto(name, *args, **kwargs):
++            if name.startswith("cryptography"):
++                raise ImportError("cryptography intentionally unavailable")
++            return original_import(name, *args, **kwargs)
++
++        with patch("builtins.__import__", side_effect=import_without_crypto), patch.object(
++            adapter,
++            "_namespace_from_mapping",
++        ) as normalize:
++            response = asyncio.run(
++                adapter._handle_webhook_request(
++                    self._webhook_request(
++                        body,
++                        remote="203.0.113.74",
++                    )
++                )
++            )
++
++        self.assertEqual(response.status, 503)
++        self.assertEqual(adapter._webhook_rate_counts, {})
++        normalize.assert_not_called()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_nested_message_content_is_dropped_after_pairing_admission(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(
++            PlatformConfig(extra={"verification_token": "expected"})
++        )
++        nested_content = "[" * 1_000 + "0" + "]" * 1_000
++        body = json.dumps(
++            {
++                "header": {
++                    "token": "expected",
++                    "event_type": "im.message.receive_v1",
++                },
++                "event": {
++                    "sender": {
++                        "sender_id": {"open_id": "ou_unpaired"},
++                        "sender_type": "user",
++                    },
++                    "message": {
++                        "message_id": "om_nested_content",
++                        "chat_id": "oc_pairing",
++                        "chat_type": "p2p",
++                        "message_type": "interactive",
++                        "content": nested_content,
++                        "mentions": [],
++                    },
++                },
++            }
++        ).encode()
++        captured = []
++
++        with patch.object(adapter, "_on_message_event", side_effect=captured.append):
++            response = asyncio.run(
++                adapter._handle_webhook_request(
++                    self._webhook_request(
++                        body,
++                        remote="203.0.113.75",
++                    )
++                )
++            )
++
++        self.assertEqual(response.status, 200)
++        self.assertEqual(len(captured), 1)
++        with patch.object(adapter, "_is_duplicate", return_value=False), patch.object(
++            adapter,
++            "_admit",
++            wraps=adapter._admit,
++        ) as admit, patch.object(
++            adapter,
++            "_handle_message_with_guards",
++            new_callable=AsyncMock,
++        ) as agent_dispatch:
++            asyncio.run(adapter._handle_message_event_data(captured[0]))
++
++        admit.assert_called_once()
++        agent_dispatch.assert_not_awaited()
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_url_verification_challenge_passes_with_token_only(self):
++        """Challenge requests require a token but no encrypt-key signature."""
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"verification_token": "expected"}))
++        body = json.dumps(
++            {
++                "type": "url_verification",
++                "token": "expected",
++                "challenge": "test_challenge_token",
++            }
++        ).encode()
+         request = SimpleNamespace(
+             remote="127.0.0.1",
+             content_length=None,
+@@ -3627,6 +4192,126 @@ def test_webhook_url_verification_challenge_passes_without_signature(self):
+         self.assertEqual(response.status, 200)
+         self.assertIn(b"test_challenge_token", response.body)
+ 
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_url_verification_with_both_secrets_remains_unsigned(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(
++            PlatformConfig(
++                extra={
++                    "verification_token": "expected",
++                    "encrypt_key": "expected-key",
++                }
++            )
++        )
++        body = _encrypted_webhook_body(
++            {
++                "type": "url_verification",
++                "token": "expected",
++                "challenge": "test_challenge_token",
++            },
++            "expected-key",
++        )
++
++        response = asyncio.run(
++            adapter._handle_webhook_request(
++                self._webhook_request(body, remote="203.0.113.29")
++            )
++        )
++
++        self.assertEqual(response.status, 200)
++        self.assertIn(b"test_challenge_token", response.body)
++        self.assertEqual([entry[0] for entry in adapter._webhook_rate_counts.values()], [1])
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_webhook_url_verification_rejects_encrypt_key_only_configuration(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig(extra={"encrypt_key": "expected-key"}))
++        body = _encrypted_webhook_body(
++            {
++                "type": "url_verification",
++                "token": "unconfigured",
++                "challenge": "attacker-challenge",
++            },
++            "expected-key",
++        )
++        response = asyncio.run(
++            adapter._handle_webhook_request(
++                self._webhook_request(body, remote="203.0.113.30")
++            )
++        )
++
++        self.assertEqual(response.status, 401)
++        self.assertNotIn(b"attacker-challenge", response.body)
++        self.assertEqual(adapter._webhook_rate_counts, {})
++
++
++@unittest.skipIf(_HAS_LARK_OAPI, "covered by the full Feishu SDK test surface")
++class TestWebhookSecurityWithoutSdk(unittest.TestCase):
++    """SDK-independent webhook regressions enforced by the standard CI extras."""
++
++    _webhook_request = staticmethod(TestWebhookSecurity._webhook_request)
++    test_invalid_verification_tokens_do_not_consume_authenticated_rate_limit = (
++        TestWebhookSecurity.test_invalid_verification_tokens_do_not_consume_authenticated_rate_limit
++    )
++    test_invalid_signatures_do_not_consume_authenticated_rate_limit = (
++        TestWebhookSecurity.test_invalid_signatures_do_not_consume_authenticated_rate_limit
++    )
++    test_authenticated_webhook_requests_remain_rate_limited = (
++        TestWebhookSecurity.test_authenticated_webhook_requests_remain_rate_limited
++    )
++    test_invalid_auth_anomaly_tracking_is_bounded = (
++        TestWebhookSecurity.test_invalid_auth_anomaly_tracking_is_bounded
++    )
++    test_anomaly_tracking_prunes_expired_sources_at_capacity = (
++        TestWebhookSecurity.test_anomaly_tracking_prunes_expired_sources_at_capacity
++    )
++    test_anomaly_tracking_amortizes_capacity_sweeps = (
++        TestWebhookSecurity.test_anomaly_tracking_amortizes_capacity_sweeps
++    )
++    test_webhook_request_rejects_non_object_json = (
++        TestWebhookSecurity.test_webhook_request_rejects_non_object_json
++    )
++    test_webhook_request_accepts_object_json = (
++        TestWebhookSecurity.test_webhook_request_accepts_object_json
++    )
++    test_webhook_request_rejects_large_integer_before_quota_or_dispatch = (
++        TestWebhookSecurity.test_webhook_request_rejects_large_integer_before_quota_or_dispatch
++    )
++    test_webhook_request_rejects_malformed_nested_shapes_before_quota = (
++        TestWebhookSecurity.test_webhook_request_rejects_malformed_nested_shapes_before_quota
++    )
++    test_webhook_ordinary_events_require_both_configured_secrets = (
++        TestWebhookSecurity.test_webhook_ordinary_events_require_both_configured_secrets
++    )
++    test_webhook_encrypted_ordinary_event_supports_encrypt_key_only = (
++        TestWebhookSecurity.test_webhook_encrypted_ordinary_event_supports_encrypt_key_only
++    )
++    test_webhook_encrypted_event_without_local_key_fails_before_quota_or_dispatch = (
++        TestWebhookSecurity.test_webhook_encrypted_event_without_local_key_fails_before_quota_or_dispatch
++    )
++    test_webhook_invalid_ciphertext_fails_uniformly_before_quota_or_dispatch = (
++        TestWebhookSecurity.test_webhook_invalid_ciphertext_fails_uniformly_before_quota_or_dispatch
++    )
++    test_webhook_encryption_dependency_failure_is_controlled = (
++        TestWebhookSecurity.test_webhook_encryption_dependency_failure_is_controlled
++    )
++    test_webhook_nested_message_content_is_dropped_after_pairing_admission = (
++        TestWebhookSecurity.test_webhook_nested_message_content_is_dropped_after_pairing_admission
++    )
++    test_webhook_url_verification_challenge_passes_with_token_only = (
++        TestWebhookSecurity.test_webhook_url_verification_challenge_passes_with_token_only
++    )
++    test_webhook_url_verification_with_both_secrets_remains_unsigned = (
++        TestWebhookSecurity.test_webhook_url_verification_with_both_secrets_remains_unsigned
++    )
++    test_webhook_url_verification_rejects_encrypt_key_only_configuration = (
++        TestWebhookSecurity.test_webhook_url_verification_rejects_encrypt_key_only_configuration
++    )
++
+ 
+ class TestDedupTTL(unittest.TestCase):
+     """Tests for TTL-aware deduplication."""
+diff --git a/tests/gateway/test_setup_feishu.py b/tests/gateway/test_setup_feishu.py
+index 9229e34dc367..8a1edab3b433 100644
+--- a/tests/gateway/test_setup_feishu.py
++++ b/tests/gateway/test_setup_feishu.py
+@@ -19,12 +19,14 @@ def _run_setup_feishu(
+     prompt_choice_responses=None,
+     prompt_responses=None,
+     existing_env=None,
++    info_messages=None,
+ ):
+     """Run _setup_feishu() with mocked I/O and return the env vars that were saved.
+ 
+     Returns a dict of {env_var_name: value} for all save_env_value calls.
+     """
+     existing_env = existing_env or {}
++    info_messages = info_messages if info_messages is not None else []
+     prompt_yes_no_responses = list(prompt_yes_no_responses or [True])
+     # QR path: method(0), dm(0), group(0) — 3 choices (no connection mode)
+     # Manual path: method(1), domain(0), connection(0), dm(0), group(0) — 5 choices
+@@ -57,7 +59,7 @@ def mock_remove(name):
+          patch("hermes_cli.setup.prompt_choice", side_effect=prompt_choice_responses), \
+          patch("hermes_cli.cli_output.prompt", side_effect=prompt_responses), \
+          patch("hermes_cli.cli_output.print_header"), \
+-         patch("hermes_cli.cli_output.print_info"), \
++         patch("hermes_cli.cli_output.print_info", side_effect=info_messages.append), \
+          patch("hermes_cli.cli_output.print_success"), \
+          patch("hermes_cli.cli_output.print_warning"), \
+          patch("hermes_cli.cli_output.print_error"), \
+@@ -150,6 +152,24 @@ def test_manual_path_webhook(self, _mock_probe):
+         )
+         assert env["FEISHU_CONNECTION_MODE"] == "webhook"
+ 
++    @patch("plugins.platforms.feishu.adapter.probe_bot", return_value=None)
++    def test_manual_webhook_explains_secret_contract(self, _mock_probe):
++        info_messages = []
++
++        _run_setup_feishu(
++            qr_result=None,
++            prompt_choice_responses=[1, 0, 1, 0, 0],
++            prompt_responses=["cli_manual", "secret_manual", ""],
++            info_messages=info_messages,
++        )
++
++        output = "\n".join(info_messages)
++        assert "FEISHU_VERIFICATION_TOKEN is required" in output
++        assert "webhook URL verification" in output
++        assert "FEISHU_ENCRYPT_KEY enables encrypted callback bodies" in output
++        assert "raw-request signatures on ordinary events" in output
++        assert "configure both secrets for new webhooks" in output
++
+ 
+ # ---------------------------------------------------------------------------
+ # DM security policy
+diff --git a/website/docs/user-guide/messaging/feishu.md b/website/docs/user-guide/messaging/feishu.md
+index 1c5a66543e43..7130cf50ada0 100644
+--- a/website/docs/user-guide/messaging/feishu.md
++++ b/website/docs/user-guide/messaging/feishu.md
+@@ -127,7 +127,9 @@ FEISHU_WEBHOOK_PORT=8765         # default: 8765
+ FEISHU_WEBHOOK_PATH=/feishu/webhook  # default: /feishu/webhook
+ ```
+ 
+-When Feishu sends a URL verification challenge (`type: url_verification`), the webhook responds automatically so you can complete the subscription setup in the Feishu developer console. The challenge response is gated on `FEISHU_VERIFICATION_TOKEN` when set — challenge requests with a missing or mismatched token are rejected so an unauthenticated remote cannot prove endpoint control by echoing attacker-controlled challenge data.
++When Feishu sends a URL verification challenge (`type: url_verification`), the webhook responds automatically so you can complete the subscription setup in the Feishu developer console. You must configure `FEISHU_VERIFICATION_TOKEN` before registering or re-registering the callback URL. Challenge requests with a missing or mismatched token are rejected so an unauthenticated remote cannot prove endpoint control by echoing attacker-controlled challenge data. When `FEISHU_ENCRYPT_KEY` is configured in Feishu, the challenge arrives inside an encrypted outer object; Hermes decrypts it before checking the verification token. The challenge remains unsigned after decryption, so the Encrypt Key does not replace the verification token during onboarding.
++
++Already-onboarded webhook deployments that configure only `FEISHU_ENCRYPT_KEY` remain supported for encrypted, correctly signed ordinary event deliveries. They need to add `FEISHU_VERIFICATION_TOKEN` only before repeating URL verification.
+ 
+ ## Step 3: Configure Hermes
+ 
+@@ -191,19 +193,19 @@ If you leave the allowlist empty, anyone who can reach the bot may be able to us
+ 
+ ### Webhook Encryption Key
+ 
+-When running in webhook mode, set an encryption key to enable signature verification of inbound webhook payloads:
++When running in webhook mode, set an encryption key to enable encrypted callback bodies and signature verification of ordinary inbound webhook event deliveries:
+ 
+ ```bash
+ FEISHU_ENCRYPT_KEY=your-encrypt-key
+ ```
+ 
+-This key is found in the **Event Subscriptions** section of your Feishu app configuration. When set, the adapter verifies every webhook request using the signature algorithm:
++This key is found in the **Event Subscriptions** section of your Feishu app configuration. Feishu sends an outer JSON object containing `encrypt`; Hermes derives an AES key with SHA-256, decrypts the IV-prefixed AES-CBC payload, and validates PKCS7 padding before parsing the event. For ordinary events, Hermes also verifies the original encrypted request body using:
+ 
+ ```
+ SHA256(timestamp + nonce + encrypt_key + body)
+ ```
+ 
+-The computed hash is compared against the `x-lark-signature` header using timing-safe comparison. Requests with invalid or missing signatures are rejected with HTTP 401.
++The computed hash is compared against the `x-lark-signature` header using timing-safe comparison. Ordinary event deliveries with invalid or missing signatures are rejected with HTTP 401 before delivery quota or dispatch. Feishu's URL-verification challenge is unsigned after decryption, so onboarding is authenticated with `FEISHU_VERIFICATION_TOKEN` instead.
+ 
+ :::tip
+ In WebSocket mode, signature verification is handled by the SDK itself, so `FEISHU_ENCRYPT_KEY` is optional. In webhook mode, it is strongly recommended for production.
+@@ -211,15 +213,15 @@ In WebSocket mode, signature verification is handled by the SDK itself, so `FEIS
+ 
+ ### Verification Token
+ 
+-An additional layer of authentication that checks the `token` field inside webhook payloads:
++Set the verification token before registering or re-registering a webhook callback URL:
+ 
+ ```bash
+ FEISHU_VERIFICATION_TOKEN=your-verification-token
+ ```
+ 
+-This token is also found in the **Event Subscriptions** section of your Feishu app. When set, every inbound webhook payload must contain a matching `token` in its `header` object. Mismatched tokens are rejected with HTTP 401.
++This token is also found in the **Event Subscriptions** section of your Feishu app. It is required for URL-verification onboarding: Hermes rejects a challenge when no verification token is configured or when the token in the plaintext or decrypted challenge does not match. For ordinary event deliveries, configuring the token adds a payload-token check; the plaintext or decrypted `header.token` must match or Hermes returns HTTP 401.
+ 
+-Both `FEISHU_ENCRYPT_KEY` and `FEISHU_VERIFICATION_TOKEN` can be used together for defense in depth.
++For new webhook deployments, configure both secrets: `FEISHU_VERIFICATION_TOKEN` authenticates URL verification and checks event tokens, while `FEISHU_ENCRYPT_KEY` decrypts callback bodies and verifies signatures on ordinary event deliveries. Already-onboarded encrypt-key-only deployments continue to accept encrypted, correctly signed ordinary events, but must add the verification token before repeating URL verification.
+ 
+ ## Group Message Policy
+ 
+@@ -454,13 +456,13 @@ Messages within the same chat are processed serially (one at a time) to maintain
+ 
+ ## Rate Limiting (Webhook Mode)
+ 
+-In webhook mode, the adapter enforces per-IP rate limiting to protect against abuse:
++In webhook mode, the adapter enforces a per-IP authenticated-delivery quota after a request passes the configured authentication checks. Requests rejected before authentication do not consume this quota:
+ 
+-- **Window:** 60-second sliding window
+-- **Limit:** 120 requests per window per (app_id, path, IP) triple
++- **Window:** 60-second fixed window starting with the first authenticated request for the (app_id, path, IP) triple
++- **Limit:** 120 authenticated requests per window per (app_id, path, IP) triple
+ - **Tracking cap:** Up to 4096 unique keys tracked (prevents unbounded memory growth)
+ 
+-Requests that exceed the limit receive HTTP 429 (Too Many Requests).
++Authenticated requests that exceed the limit receive HTTP 429 (Too Many Requests). If the webhook endpoint is exposed to the network, configure request and concurrency limits at the ingress or reverse proxy to protect against unauthenticated network abuse.
+ 
+ ### Webhook Anomaly Tracking
+ 
+@@ -548,7 +550,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
+ | `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
+ | `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
+ | `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
+-| `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
++| `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for callback decryption and ordinary-event signature verification |
+ | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
+ | `FEISHU_GROUP_POLICY` | — | `allowlist` | Group message policy: `open`, `allowlist`, `disabled` |
+ | `FEISHU_BOT_OPEN_ID` | — | _(empty)_ | Bot's open_id (for @mention detection) |
+@@ -583,7 +585,7 @@ WebSocket and per-group ACL settings are configured via `config.yaml` under `pla
+ | Peer bot messages still ignored after enabling `FEISHU_ALLOW_BOTS` | Hermes can't identify itself yet — set `FEISHU_BOT_OPEN_ID` (and `FEISHU_BOT_USER_ID` if your app uses `sender_id_type=user_id`). |
+ | Peer bots show as `ou_xxxxxx` instead of by name | Grant the `application:bot.basic_info:read` scope. |
+ | Error 200340 when clicking approval buttons | Enable **Interactive Card** capability and configure **Card Request URL** in the Feishu Developer Console. See [Required Feishu App Configuration](#required-feishu-app-configuration) above. |
+-| `Webhook rate limit exceeded` | More than 120 requests/minute from the same IP. This is usually a misconfiguration or loop. |
++| `Webhook rate limit exceeded` | More than 120 authenticated requests arrived from the same IP during its current 60-second fixed window. This is usually a misconfiguration or loop. |
+ 
+ ## Toolset
+ 
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
+index 8a295b128d24..1d46b2067f83 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
+@@ -93,7 +93,9 @@ FEISHU_WEBHOOK_PORT=8765         # 默认：8765
+ FEISHU_WEBHOOK_PATH=/feishu/webhook  # 默认：/feishu/webhook
+ ```
+ 
+-当飞书发送 URL 验证挑战（`type: url_verification`）时，webhook 会自动响应，以便你在飞书开发者控制台完成订阅配置。当设置了 `FEISHU_VERIFICATION_TOKEN` 时，挑战响应会进行 token 校验——token 缺失或不匹配的挑战请求将被拒绝，防止未经认证的远端通过回显攻击者控制的挑战数据来证明端点控制权。
++当飞书发送 URL 验证挑战（`type: url_verification`）时，webhook 会自动响应，以便你在飞书开发者控制台完成订阅配置。在注册或重新注册回调 URL 前，必须配置 `FEISHU_VERIFICATION_TOKEN`。token 缺失或不匹配的挑战请求将被拒绝，防止未经认证的远端通过回显攻击者控制的挑战数据来证明端点控制权。在飞书中配置 `FEISHU_ENCRYPT_KEY` 后，挑战会包含在加密的外层对象中；Hermes 先解密，再检查 verification token。解密后的挑战仍然没有签名，因此 Encrypt Key 不能替代接入验证 token。
++
++已经完成接入且仅配置 `FEISHU_ENCRYPT_KEY` 的 webhook 部署仍可接收加密且已正确签名的普通事件；只有在重新执行 URL 验证前才需要补充 `FEISHU_VERIFICATION_TOKEN`。
+ 
+ ## 第三步：配置 Hermes
+ 
+@@ -157,19 +159,19 @@ FEISHU_ALLOWED_USERS=ou_xxx,ou_yyy
+ 
+ ### Webhook 加密密钥
+ 
+-在 webhook 模式下运行时，设置加密密钥以启用入站 webhook payload 的签名验证：
++在 webhook 模式下运行时，设置加密密钥以启用回调正文加密和普通入站 webhook 事件的签名验证：
+ 
+ ```bash
+ FEISHU_ENCRYPT_KEY=your-encrypt-key
+ ```
+ 
+-该密钥可在飞书应用配置的 **事件订阅** 部分找到。设置后，适配器使用以下签名算法验证每个 webhook 请求：
++该密钥可在飞书应用配置的 **事件订阅** 部分找到。飞书发送包含 `encrypt` 字段的外层 JSON 对象；Hermes 使用 SHA-256 派生 AES 密钥，解密带 IV 前缀的 AES-CBC payload，并在解析事件前验证 PKCS7 填充。对于普通事件，Hermes 还使用以下算法验证原始加密请求正文：
+ 
+ ```
+ SHA256(timestamp + nonce + encrypt_key + body)
+ ```
+ 
+-计算出的哈希值与 `x-lark-signature` 请求头进行时序安全比较。签名无效或缺失的请求将被拒绝，返回 HTTP 401。
++计算出的哈希值与 `x-lark-signature` 请求头进行时序安全比较。签名无效或缺失的普通事件会在消耗投递配额或分发前被拒绝，返回 HTTP 401。飞书的 URL 验证挑战解密后没有签名，因此接入验证改由 `FEISHU_VERIFICATION_TOKEN` 认证。
+ 
+ :::tip
+ 在 WebSocket 模式下，签名验证由 SDK 自身处理，因此 `FEISHU_ENCRYPT_KEY` 是可选的。在 webhook 模式下，生产环境强烈推荐设置。
+@@ -177,15 +179,15 @@ SHA256(timestamp + nonce + encrypt_key + body)
+ 
+ ### 验证 Token
+ 
+-对 webhook payload 中 `token` 字段进行检查的额外认证层：
++注册或重新注册 webhook 回调 URL 前，请设置验证 token：
+ 
+ ```bash
+ FEISHU_VERIFICATION_TOKEN=your-verification-token
+ ```
+ 
+-该 token 同样可在飞书应用的 **事件订阅** 部分找到。设置后，每个入站 webhook payload 的 `header` 对象中必须包含匹配的 `token`。token 不匹配的请求将被拒绝，返回 HTTP 401。
++该 token 同样可在飞书应用的 **事件订阅** 部分找到。URL 验证接入必须使用它：未配置验证 token，或明文/解密后挑战中的 `token` 不匹配时，Hermes 会拒绝该挑战。对于普通事件，配置该 token 会额外检查 payload token；明文或解密后的 `header.token` 必须匹配，否则 Hermes 返回 HTTP 401。
+ 
+-`FEISHU_ENCRYPT_KEY` 和 `FEISHU_VERIFICATION_TOKEN` 可同时使用，实现纵深防御。
++新建 webhook 部署应同时配置两个 secret：`FEISHU_VERIFICATION_TOKEN` 用于认证 URL 验证并检查事件 token，`FEISHU_ENCRYPT_KEY` 用于解密回调正文并验证普通事件的签名。已经完成接入且仅配置 encrypt key 的部署仍会接受加密且正确签名的普通事件，但在重新执行 URL 验证前必须补充 verification token。
+ 
+ ## 群消息策略
+ 
+@@ -397,13 +399,13 @@ Agent 工作期间，机器人会在你的消息上显示 `Typing` 表情回应
+ 
+ ## 速率限制（Webhook 模式）
+ 
+-在 webhook 模式下，适配器对每个 IP 强制执行速率限制，防止滥用：
++在 webhook 模式下，请求通过已配置的认证检查后，适配器会对每个 IP 执行已认证投递配额。认证前即被拒绝的流量不会消耗此配额：
+ 
+-- **窗口：** 60 秒滑动窗口
+-- **限制：** 每个（app_id, path, IP）三元组每窗口 120 次请求
++- **窗口：** 60 秒固定窗口，从该（app_id, path, IP）三元组的第一个已认证请求开始
++- **限制：** 每个（app_id, path, IP）三元组每窗口 120 次已认证请求
+ - **追踪上限：** 最多追踪 4096 个唯一键（防止内存无限增长）
+ 
+-超出限制的请求将收到 HTTP 429（请求过多）。
++超出限制的已认证请求将收到 HTTP 429（请求过多）。如果 webhook 端点暴露在网络中，请在入口或反向代理层配置请求和并发限制，以防范未经认证的网络滥用。
+ 
+ ### Webhook 异常追踪
+ 
+@@ -491,7 +493,7 @@ platforms:
+ | `FEISHU_ALLOW_BOTS` | — | `none` | 接受其他机器人消息：`none`、`mentions` 或 `all` |
+ | `FEISHU_REQUIRE_MENTION` | — | `true` | 群消息是否必须 @提及 机器人 |
+ | `FEISHU_HOME_CHANNEL` | — | — | cron/通知输出的聊天 ID |
+-| `FEISHU_ENCRYPT_KEY` | — | _（空）_ | webhook 签名验证的加密密钥 |
++| `FEISHU_ENCRYPT_KEY` | — | _（空）_ | 用于回调解密和普通事件签名验证的加密密钥 |
+ | `FEISHU_VERIFICATION_TOKEN` | — | _（空）_ | webhook payload 认证的验证 token |
+ | `FEISHU_GROUP_POLICY` | — | `allowlist` | 群消息策略：`open`、`allowlist`、`disabled` |
+ | `FEISHU_BOT_OPEN_ID` | — | _（空）_ | 机器人的 open_id（用于 @提及 检测） |
+@@ -526,8 +528,8 @@ WebSocket 和按群 ACL 设置通过 `config.yaml` 的 `platforms.feishu.extra`
+ | 启用 `FEISHU_ALLOW_BOTS` 后对端机器人消息仍被忽略 | Hermes 尚无法识别自身——请设置 `FEISHU_BOT_OPEN_ID`（若应用使用 `sender_id_type=user_id` 则同时设置 `FEISHU_BOT_USER_ID`）。 |
+ | 对端机器人显示为 `ou_xxxxxx` 而非名称 | 授予 `application:bot.basic_info:read` 权限范围。 |
+ | 点击审批按钮时出现错误 200340 | 在飞书开发者控制台启用**交互式卡片**能力并配置**卡片请求 URL**。参见上方[飞书应用所需配置](#required-feishu-app-configuration)。 |
+-| `Webhook rate limit exceeded` | 同一 IP 每分钟请求超过 120 次。通常是配置错误或循环导致。 |
++| `Webhook rate limit exceeded` | 同一 IP 在当前 60 秒固定窗口内收到的已认证请求超过 120 次。通常是配置错误或循环导致。 |
+ 
+ ## 工具集
+ 
+-飞书 / Lark 使用 `hermes-feishu` 平台预设，包含与 Telegram 及其他基于 gateway 的消息平台相同的核心工具。
+\ No newline at end of file
++飞书 / Lark 使用 `hermes-feishu` 平台预设，包含与 Telegram 及其他基于 gateway 的消息平台相同的核心工具。

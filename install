@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DEPS=false
+BOOTSTRAPPED_DEPS=false
+for argument in "$@"; do
+  [ "$argument" = "--install-deps" ] && INSTALL_DEPS=true
+done
+
+python_usable() {
+  command -v python3 >/dev/null 2>&1 && \
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+      >/dev/null 2>&1
+}
+
+if ! python_usable; then
+  if [ "$INSTALL_DEPS" != true ]; then
+    printf '%s\n' \
+      'Python 3.10 or newer is required.' \
+      'Install the Brewfile explicitly with: ./install --install-deps' >&2
+    exit 2
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Homebrew is not installed and will not be installed implicitly.' \
+      'Install Homebrew from https://brew.sh, then rerun ./install --install-deps.' >&2
+    exit 2
+  fi
+  brew bundle --file "$ROOT/Brewfile"
+  brew_root="$(brew --prefix)"
+  python_root="$(brew --prefix python@3.13)"
+  node_root="$(brew --prefix node@22)"
+  PATH="$python_root/bin:$node_root/bin:$brew_root/bin:$brew_root/sbin:$PATH"
+  export PATH
+  BOOTSTRAPPED_DEPS=true
+fi
+
+PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ] && command -v brew >/dev/null 2>&1; then
+  for candidate in \
+    "$(brew --prefix python@3.13 2>/dev/null)/bin/python3.13" \
+    "$(brew --prefix python@3.13 2>/dev/null)/bin/python3"; do
+    if [ -x "$candidate" ]; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+[ -n "$PYTHON" ] && \
+  "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+    >/dev/null 2>&1 || {
+  printf 'Python installation completed but Python 3.10+ is not discoverable.\n' >&2
+  exit 2
+}
+
+arguments=()
+for argument in "$@"; do
+  if [ "$BOOTSTRAPPED_DEPS" = true ] && [ "$argument" = "--install-deps" ]; then
+    continue
+  fi
+  arguments+=("$argument")
+done
+exec "$PYTHON" "$ROOT/scripts/onboard.py" setup "${arguments[@]}"

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec pi \
+  --provider amazon-bedrock \
+  --model global.anthropic.claude-opus-4-8 \
+  --thinking xhigh \
+  "$@"
